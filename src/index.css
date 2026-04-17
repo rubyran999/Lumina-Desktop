@@ -1,0 +1,86 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Outfit", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-widget-bg: rgba(21, 22, 25, 0.9);
+  --color-widget-border: rgba(255, 255, 255, 0.1);
+  --color-accent: #6366f1;
+  --color-accent-foreground: #ffffff;
+}
+
+@layer base {
+  body {
+    @apply bg-transparent text-slate-200 antialiased overflow-hidden;
+    font-family: var(--font-sans);
+  }
+}
+
+.glass {
+  background: var(--color-widget-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--color-widget-border);
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.05) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.prose {
+  @apply text-slate-200;
+}
+
+.prose p {
+  @apply my-1 first:mt-0 last:mb-0;
+}
+
+.prose a {
+  @apply text-indigo-400 no-underline hover:underline;
+}
+
+.prose code {
+  @apply bg-white/10 px-1 py-0.5 rounded text-indigo-300 font-mono text-[11px];
+}
+
+.prose ul, .prose ol {
+  @apply my-2 pl-4;
+}
+
+.prose li {
+  @apply my-0.5;
+}
+
+
+
