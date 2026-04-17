@@ -1,0 +1,5 @@
+{
+  "name": "Lumina: Desktop Helper",
+  "description": "A lightweight, minimal desktop helper for quick search, calculations, and reminders. Designed to minimize interruption and maximize productivity.",
+  "requestFramePermissions": []
+}
