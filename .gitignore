@@ -12,3 +12,8 @@ src-tauri/Cargo.lock
 .env
 .idea
 .vscode
+
+# 构建产物和临时文件
+dist/
+rustup-init.exe
+.claude/
