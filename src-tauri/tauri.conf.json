@@ -25,7 +25,7 @@
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
-        "skipTaskbar": false,
+        "skipTaskbar": true,
         "center": false,
         "visible": false,
         "shadow": false,
@@ -37,10 +37,7 @@
     "security": {
       "csp": null
     },
-    "trayIcon": {
-      "iconPath": "icons/32x32.png",
-      "menuOnLeftClick": true
-    }
+    "trayIcon": null
   },
   "bundle": {
     "active": true,
