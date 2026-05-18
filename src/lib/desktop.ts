@@ -134,3 +134,29 @@ export async function startDragging(): Promise<void> {
     }
   }
 }
+
+// Resize window to specified dimensions
+export async function resizeWindow(width: number, height: number): Promise<void> {
+  const isTauri = await loadTauriApis();
+  if (isTauri && windowApi) {
+    try {
+      const window = windowApi.getCurrentWindow();
+      await window.setSize(new windowApi.LogicalSize(width, height));
+    } catch (error) {
+      console.error('Failed to resize window:', error);
+    }
+  }
+}
+
+// Set minimum window size
+export async function setMinWindowSize(width: number, height: number): Promise<void> {
+  const isTauri = await loadTauriApis();
+  if (isTauri && windowApi) {
+    try {
+      const window = windowApi.getCurrentWindow();
+      await window.setMinSize(new windowApi.LogicalSize(width, height));
+    } catch (error) {
+      console.error('Failed to set min window size:', error);
+    }
+  }
+}

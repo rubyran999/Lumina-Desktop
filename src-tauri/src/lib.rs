@@ -1,7 +1,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, Runtime, WebviewUrl, WebviewWindowBuilder,
+    Manager, Emitter,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,7 +31,7 @@ pub fn run() {
             // Build tray icon
             let _tray = TrayIconBuilder::new()
                 .menu(&menu)
-                .menu_on_left_click(true)
+                .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         app.exit(0);
@@ -73,7 +73,7 @@ pub fn run() {
             {
                 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
-                let app_handle = app.handle().clone();
+                let _app_handle = app.handle().clone();
                 let shortcut = Shortcut::new(Some(tauri_plugin_global_shortcut::Modifiers::CONTROL), tauri_plugin_global_shortcut::Code::KeyQ);
 
                 app.global_shortcut()
@@ -84,6 +84,8 @@ pub fn run() {
                             } else {
                                 let _ = window.show();
                                 let _ = window.set_focus();
+                                // Emit event to frontend to focus input
+                                let _ = window.emit("shortcut-show", ());
                             }
                         }
                     })?;

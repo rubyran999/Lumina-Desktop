@@ -7,7 +7,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from './lib/utils';
 import { callAI, Message, AIProvider } from './services/geminiService';
-import { showNotification, playNotificationSound, hideWindow, isDesktopApp } from './lib/desktop';
+import { showNotification, playNotificationSound, hideWindow, isDesktopApp, resizeWindow } from './lib/desktop';
+import { listen } from '@tauri-apps/api/event';
 
 interface Reminder {
   id: string;
@@ -258,8 +259,10 @@ export default function App() {
     const savedPomoTime = localStorage.getItem('lumina_pomo_time');
     if (savedPomoTime !== null) setPomoTime(JSON.parse(savedPomoTime));
 
-    const savedPomoActive = localStorage.getItem('lumina_pomo_active');
-    if (savedPomoActive !== null) setIsPomoActive(JSON.parse(savedPomoActive));
+    // Do NOT restore pomo active state - always start inactive
+    // const savedPomoActive = localStorage.getItem('lumina_pomo_active');
+    // if (savedPomoActive !== null) setIsPomoActive(JSON.parse(savedPomoActive));
+    setIsPomoActive(false); // Always start inactive
 
     const savedPomoMode = localStorage.getItem('lumina_pomo_mode');
     if (savedPomoMode !== null) setPomoMode(savedPomoMode as 'work' | 'break');
@@ -336,9 +339,26 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     document.addEventListener('mousedown', handleClickOutside);
+
+    // Listen for Tauri global shortcut event
+    let unlistenFn: (() => void) | null = null;
+    if (isDesktopApp()) {
+      listen('shortcut-show', () => {
+        setIsExpanded(true);
+        setIsUserExpanded(false);
+        setShowSettings(false);
+        // Focus input on next tick
+        setTimeout(() => inputRef.current?.focus(), 100);
+        setLastActionTime(Date.now());
+      }).then((unlisten) => {
+        unlistenFn = unlisten;
+      });
+    }
+
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('mousedown', handleClickOutside);
+      if (unlistenFn) unlistenFn();
     };
   }, []);
 
@@ -447,6 +467,19 @@ export default function App() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, isLoading]);
+
+  // Resize window based on expanded state to enable click-through when collapsed
+  useEffect(() => {
+    if (isDesktopApp()) {
+      if (isExpanded) {
+        // Expanded state: full size (w-[400px] max-h-[85vh] or w-[300px])
+        resizeWindow(420, 700);
+      } else {
+        // Collapsed state: just the bubble size (w-14 h-14 = 56x56px, plus some margin)
+        resizeWindow(80, 120);
+      }
+    }
+  }, [isExpanded]);
 
   // Reminder trigger logic
   useEffect(() => {
@@ -1990,10 +2023,11 @@ export default function App() {
       {/* Bubble Trigger */}
       <motion.button
         layoutId="bubble"
+        data-tauri-drag-region
         onClick={() => {
           setIsExpanded(!isExpanded);
           if (!isExpanded) {
-            setIsUserExpanded(false); 
+            setIsUserExpanded(false);
             setShowSettings(false);
             // Focus input on next tick
             setTimeout(() => inputRef.current?.focus(), 50);
@@ -2003,7 +2037,7 @@ export default function App() {
         whileHover={{ scale: 1.05 }}
         whileTap={{ scale: 0.95 }}
         className={cn(
-          "w-14 h-14 rounded-full flex items-center justify-center shadow-2xl transition-all duration-500",
+          "w-14 h-14 rounded-full flex items-center justify-center shadow-2xl transition-all duration-500 cursor-move",
           isExpanded ? "bg-white/10 text-white rotate-90" : "bg-indigo-600 text-white"
         )}
       >
