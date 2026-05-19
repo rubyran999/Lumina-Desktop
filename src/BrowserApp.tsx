@@ -1,78 +1,1346 @@
-import React from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Search, Bell, Settings, X, Clock, Command, Send, Sparkles, Trash2, CheckCircle2, MessageSquare, Minimize2, Maximize2, Cpu, Globe, Eraser, Link, ChevronDown, Play, Edit3, Save, Pause, RotateCcw, FileSpreadsheet, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { format, parseISO } from 'date-fns';
+import { format, isAfter, parseISO } from 'date-fns';
+import * as math from 'mathjs';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from './lib/utils';
-import { useCore } from './hooks/_core';
-import { COUNTRY_PRESETS, UNIT_OPTIONS } from './types';
-import type { AIProvider } from './services/geminiService';
+import { callAI, Message, AIProvider } from './services/geminiService';
+import { showNotification, playNotificationSound, hideWindow, isDesktopApp, resizeWindow, setIgnoreCursorEvents } from './lib/desktop';
+import { initLogs, appendLog, updateLog, openLogs, getNextLogId, isLogWritable, flushLogQueue } from './services/dataLogService';
+import { listen } from '@tauri-apps/api/event';
+
+interface Reminder {
+  id: string;
+  task: string;
+  time?: string;
+  completed: boolean;
+  isAllDay?: boolean;
+  noTime?: boolean;
+  createdAt: string;
+  logId?: number; // CSV log row ID for in-place update
+}
+
+interface Pomo {
+  id: string;
+  name: string;
+  duration: number;
+  totalTime: number;
+  mode: 'work' | 'break';
+  isActive: boolean;
+  finishedCount: number;
+  pausesUsed: number;
+  startTime: string;
+}
+
+type SectionState = 'expanded' | 'collapsed';
+
+const COUNTRY_PRESETS: Record<string, any> = {
+  'United States': { length: 'inch', weight: 'lb', currency: 'USD', timezone: 'America/New_York', numberFormat: '1,234.56', dateFormat: 'MM/DD/YYYY', temperature: 'degF', timeFormat: '12h' },
+  'United Kingdom': { length: 'm', weight: 'kg', currency: 'GBP', timezone: 'Europe/London', numberFormat: '1,234.56', dateFormat: 'DD/MM/YYYY', temperature: 'degC', timeFormat: '24h' },
+  'China': { length: 'm', weight: 'kg', currency: 'CNY', timezone: 'Asia/Shanghai', numberFormat: '1,234.56', dateFormat: 'YYYY/MM/DD', temperature: 'degC', timeFormat: '24h' },
+  'Germany': { length: 'm', weight: 'kg', currency: 'EUR', timezone: 'Europe/Berlin', numberFormat: '1.234,56', dateFormat: 'DD.MM.YYYY', temperature: 'degC', timeFormat: '24h' },
+  'Japan': { length: 'm', weight: 'kg', currency: 'JPY', timezone: 'Asia/Tokyo', numberFormat: '1,234.56', dateFormat: 'YYYY/MM/DD', temperature: 'degC', timeFormat: '24h' },
+};
+
+const UNIT_OPTIONS = {
+  length: [
+    { label: 'Meter (m)', value: 'm' },
+    { label: 'Centimeter (cm)', value: 'cm' },
+    { label: 'Millimeter (mm)', value: 'mm' },
+    { label: 'Kilometer (km)', value: 'km' },
+    { label: 'Inch (in)', value: 'inch' },
+    { label: 'Foot (ft)', value: 'ft' },
+    { label: 'Yard (yd)', value: 'yd' },
+    { label: 'Mile (mi)', value: 'mile' },
+  ],
+  weight: [
+    { label: 'Kilogram (kg)', value: 'kg' },
+    { label: 'Gram (g)', value: 'g' },
+    { label: 'Milligram (mg)', value: 'mg' },
+    { label: 'Pound (lb)', value: 'lb' },
+    { label: 'Ounce (oz)', value: 'oz' },
+  ],
+  temperature: [
+    { label: 'Celsius (℃)', value: 'degC' },
+    { label: 'Fahrenheit (℉)', value: 'degF' },
+    { label: 'Kelvin (K)', value: 'kelvin' },
+  ],
+  timeFormat: [
+    { label: '12h (AM/PM)', value: '12h' },
+    { label: '24h', value: '24h' },
+  ],
+  currency: [
+    { label: 'USD ($)', value: 'USD' },
+    { label: 'EUR (€)', value: 'EUR' },
+    { label: 'GBP (£)', value: 'GBP' },
+    { label: 'CNY (¥)', value: 'CNY' },
+    { label: 'JPY (¥)', value: 'JPY' },
+    { label: 'CAD ($)', value: 'CAD' },
+    { label: 'AUD ($)', value: 'AUD' },
+  ],
+  timezone: [
+    { label: 'New York (EST/EDT)', value: 'America/New_York' },
+    { label: 'London (GMT/BST)', value: 'Europe/London' },
+    { label: 'Berlin (CET/CEST)', value: 'Europe/Berlin' },
+    { label: 'Shanghai (CST)', value: 'Asia/Shanghai' },
+    { label: 'Tokyo (JST)', value: 'Asia/Tokyo' },
+    { label: 'UTC', value: 'UTC' },
+  ],
+  numberFormat: [
+    { label: '1,234.56', value: '1,234.56' },
+    { label: '1.234,56', value: '1.234,56' },
+  ],
+  dateFormat: [
+    { label: 'MM/DD/YYYY', value: 'MM/DD/YYYY' },
+    { label: 'DD/MM/YYYY', value: 'DD/MM/YYYY' },
+    { label: 'YYYY/MM/DD', value: 'YYYY/MM/DD' },
+    { label: 'DD.MM.YYYY', value: 'DD.MM.YYYY' },
+  ],
+};
+
+const CITY_TO_TIMEZONE: Record<string, string> = {
+  'paris': 'Europe/Paris',
+  'london': 'Europe/London',
+  'new york': 'America/New_York',
+  'nyc': 'America/New_York',
+  'tokyo': 'Asia/Tokyo',
+  'shanghai': 'Asia/Shanghai',
+  'beijing': 'Asia/Shanghai',
+  'hong kong': 'Asia/Hong_Kong',
+  'singapore': 'Asia/Singapore',
+  'sydney': 'Australia/Sydney',
+  'los angeles': 'America/Los_Angeles',
+  'la': 'America/Los_Angeles',
+  'chicago': 'America/Chicago',
+  'dubai': 'Asia/Dubai',
+  'moscow': 'Europe/Moscow',
+  'seoul': 'Asia/Seoul',
+  'mumbai': 'Asia/Kolkata',
+  'delhi': 'Asia/Kolkata',
+  'berlin': 'Europe/Berlin',
+  'rome': 'Europe/Berlin',
+  'madrid': 'Europe/Madrid',
+  'toronto': 'America/Toronto',
+  'vancouver': 'America/Vancouver',
+  'san francisco': 'America/Los_Angeles',
+  'sf': 'America/Los_Angeles',
+  'seattle': 'America/Los_Angeles',
+  'bangkok': 'Asia/Bangkok',
+  'jakarta': 'Asia/Jakarta',
+  'manila': 'Asia/Manila',
+  'taipei': 'Asia/Taipei',
+};
+
+const CURRENCY_CODES = ['USD', 'EUR', 'GBP', 'CNY', 'JPY', 'CAD', 'AUD', 'HKD', 'SGD', 'INR', 'KRW', 'RUB', 'BRL', 'MXN', 'IDR', 'TRY', 'ZAR'];
 
 export default function App() {
-  const {
-    // UI state
-    isExpanded, setIsExpanded,
-    isUserExpanded, setIsUserExpanded,
-    showHistory,
-    showSettings, setShowSettings,
-    isFocused, setIsFocused,
-    isLoading, setIsLoading,
-    isTimeout, setIsTimeout,
-    // Input
-    query, setQuery,
-    inputRef, scrollRef, widgetRef, containerRef, settingsRef,
-    // Chat
-    messages, setMessages,
-    pendingQuery,
-    // Reminders
-    reminders, setReminders,
-    editingReminderId, setEditingReminderId,
-    editingReminderValue, setEditingReminderValue,
-    editingReminderTimeValue, setEditingReminderTimeValue,
-    reminderSectionState,
-    // Pomos
-    pomoList, setPomoList,
-    pomoSectionState,
-    pomoTime, isPomoActive, setIsPomoActive, pomoMode, pomoTotalTime, pomoName,
-    // AI
-    isAiEnabled, setIsAiEnabled,
-    apiKeys,
-    selectedProvider, setSelectedProvider,
-    customEndpoint, setCustomEndpoint,
-    location, setLocation,
-    // Preferences
-    selectedCountry, setSelectedCountry,
-    prefLength, setPrefLength,
-    prefWeight, setPrefWeight,
-    prefCurrency, setPrefCurrency,
-    prefTemperature, setPrefTemperature,
-    prefTimezone, setPrefTimezone,
-    prefNumberFormat, setPrefNumberFormat,
-    prefDateFormat, setPrefDateFormat,
-    prefTimeFormat, setPrefTimeFormat,
-    prefPomoFocus, setPrefPomoFocus,
-    prefPomoBreak, setPrefPomoBreak,
-    prefFocusSound, setPrefFocusSound,
-    prefNotificationSound, setPrefNotificationSound,
-    prefPomoAutoStart, setPrefPomoAutoStart,
-    // Other
-    lastActionTime, setLastActionTime,
-    isLogLocked,
-    exchangeRates,
-    timeoutRef,
-    // Derived
-    providers,
-    // Handlers
-    handleSubmit, handleRetry, handleCancel, clearConversation,
-    togglePomo, pausePomo, restartPomo, deletePomo,
-    togglePomoSection, toggleReminderSection,
-    deleteReminder, startEditingReminder, saveReminderEdit, toggleReminder,
-    formatPomoTime,
-    updateApiKey,
-    handleCountryChange,
-    openLogs,
-  } = useCore();
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [isUserExpanded, setIsUserExpanded] = useState(false);
+  const [query, setQuery] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [pomoList, setPomoList] = useState<Pomo[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
+  const [pomoSectionState, setPomoSectionState] = useState<SectionState>('collapsed');
+  const [reminderSectionState, setReminderSectionState] = useState<SectionState>('collapsed');
+  const [editingReminderId, setEditingReminderId] = useState<string | null>(null);
+  const [editingReminderValue, setEditingReminderValue] = useState('');
+  const [editingReminderTimeValue, setEditingReminderTimeValue] = useState('');
+  const [isAiEnabled, setIsAiEnabled] = useState(false);
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+  
+  // Preferences
+  const [selectedCountry, setSelectedCountry] = useState('United States');
+  const [prefLength, setPrefLength] = useState('inch');
+  const [prefWeight, setPrefWeight] = useState('lb');
+  const [prefCurrency, setPrefCurrency] = useState('USD');
+  const [prefTemperature, setPrefTemperature] = useState('degF');
+  const [prefTimezone, setPrefTimezone] = useState('America/New_York');
+  const [prefNumberFormat, setPrefNumberFormat] = useState('1,234.56');
+  const [prefDateFormat, setPrefDateFormat] = useState('MM/DD/YYYY');
+  const [prefTimeFormat, setPrefTimeFormat] = useState('12h');
+  const [prefPomoFocus, setPrefPomoFocus] = useState(25);
+  const [prefPomoBreak, setPrefPomoBreak] = useState(5);
+  const [prefFocusSound, setPrefFocusSound] = useState(true);
+  const [prefNotificationSound, setPrefNotificationSound] = useState(true);
+  const [prefPomoAutoStart, setPrefPomoAutoStart] = useState(true);
+
+  const [selectedProvider, setSelectedProvider] = useState<AIProvider>('gemini');
+  const [customEndpoint, setCustomEndpoint] = useState('');
+  const [location, setLocation] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const [lastActionTime, setLastActionTime] = useState(Date.now());
+  
+  // Pomodoro State
+  const [pomoTime, setPomoTime] = useState(25 * 60);
+  const [isPomoActive, setIsPomoActive] = useState(false);
+  const [pomoMode, setPomoMode] = useState<'work' | 'break'>('work');
+  const [pomoTotalTime, setPomoTotalTime] = useState(25 * 60);
+  const [pomoName, setPomoName] = useState('');
+  const [pomoStartTime, setPomoStartTime] = useState('');    // ISO for logging
+  const [pomoPausesUsed, setPomoPausesUsed] = useState(0);   // for logging
+  
+  const [isTimeout, setIsTimeout] = useState(false);
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null);
+  const [exchangeRates, setExchangeRates] = useState<Record<string, number>>({});
+  const [nextLogId, setNextLogId] = useState(1);
+  const [isLogLocked, setIsLogLocked] = useState(false);
+  const nextLogIdRef = useRef(1); // sync counter — avoids stale-closure bug in genLogId
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
+  const widgetRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Load state
+  useEffect(() => {
+    const fetchRates = async () => {
+      const FALLBACK_RATES: Record<string, number> = {
+        USD: 1, EUR: 0.92, GBP: 0.79, CNY: 7.23, JPY: 151.5, 
+        CAD: 1.36, AUD: 1.52, HKD: 7.82, SGD: 1.35, INR: 83.3, 
+        KRW: 1350, RUB: 92.5, BRL: 5.05, MXN: 16.5, IDR: 15900, 
+        TRY: 32.2, ZAR: 18.8
+      };
+
+      try {
+        // Primary source
+        const response = await fetch('https://api.frankfurter.app/latest?from=USD');
+        if (!response.ok) throw new Error('Primary API failed');
+        const data = await response.json();
+        if (data && data.rates) {
+          setExchangeRates({ ...data.rates, USD: 1 });
+          return;
+        }
+      } catch (e) {
+        console.warn('Primary exchange rate API failed, trying secondary...', e);
+        try {
+          // Secondary source
+          const response = await fetch('https://open.er-api.com/v6/latest/USD');
+          if (!response.ok) throw new Error('Secondary API failed');
+          const data = await response.json();
+          if (data && data.rates) {
+            setExchangeRates(data.rates);
+            return;
+          }
+        } catch (e2) {
+          console.error('All exchange rate APIs failed, using fallback rates.', e2);
+          setExchangeRates(FALLBACK_RATES);
+        }
+      }
+    };
+    fetchRates();
+
+    // Initialize the CSV log file and get the next available ID
+    initLogs();
+    getNextLogId().then(id => { setNextLogId(id); nextLogIdRef.current = id; });
+
+    const savedReminders = localStorage.getItem('lumina_reminders');
+    if (savedReminders) {
+      const parsed = JSON.parse(savedReminders);
+      // Migrate old reminders missing createdAt
+      const migrated = parsed.map((r: any) => r.createdAt ? r : { ...r, createdAt: r.time || new Date().toISOString() });
+      setReminders(migrated);
+    }
+    
+    const savedPomos = localStorage.getItem('lumina_pomos');
+    if (savedPomos) {
+      const parsed = JSON.parse(savedPomos);
+      // Migrate old pomos missing startTime
+      const migrated = parsed.map((p: any) => p.startTime ? p : { ...p, startTime: new Date().toISOString() });
+      setPomoList(migrated);
+    }
+
+    const savedKeys = localStorage.getItem('lumina_api_keys');
+    if (savedKeys) setApiKeys(JSON.parse(savedKeys));
+
+    const savedProvider = localStorage.getItem('lumina_provider');
+    if (savedProvider) setSelectedProvider(savedProvider as AIProvider);
+
+    const savedEndpoint = localStorage.getItem('lumina_custom_endpoint');
+    if (savedEndpoint) setCustomEndpoint(savedEndpoint);
+
+    const savedLocation = localStorage.getItem('lumina_location');
+    if (savedLocation) setLocation(savedLocation);
+
+    const savedHistory = localStorage.getItem('lumina_history');
+    if (savedHistory) setMessages(JSON.parse(savedHistory));
+
+    const savedAiEnabled = localStorage.getItem('lumina_ai_enabled');
+    if (savedAiEnabled !== null) setIsAiEnabled(JSON.parse(savedAiEnabled));
+
+    const savedExpanded = localStorage.getItem('lumina_is_expanded');
+    if (savedExpanded !== null) setIsExpanded(JSON.parse(savedExpanded));
+
+    const savedUserExpanded = localStorage.getItem('lumina_is_user_expanded');
+    if (savedUserExpanded !== null) setIsUserExpanded(JSON.parse(savedUserExpanded));
+
+    const savedPomoTime = localStorage.getItem('lumina_pomo_time');
+    if (savedPomoTime !== null) setPomoTime(JSON.parse(savedPomoTime));
+
+    // Do NOT restore pomo active state - always start inactive
+    // const savedPomoActive = localStorage.getItem('lumina_pomo_active');
+    // if (savedPomoActive !== null) setIsPomoActive(JSON.parse(savedPomoActive));
+    setIsPomoActive(false); // Always start inactive
+
+    const savedPomoMode = localStorage.getItem('lumina_pomo_mode');
+    if (savedPomoMode !== null) setPomoMode(savedPomoMode as 'work' | 'break');
+
+    const savedPomoTotalTime = localStorage.getItem('lumina_pomo_total_time');
+    if (savedPomoTotalTime !== null) setPomoTotalTime(JSON.parse(savedPomoTotalTime));
+
+    const savedPomoName = localStorage.getItem('lumina_pomo_name');
+    if (savedPomoName !== null) setPomoName(savedPomoName);
+
+    const savedPomoSectionState = localStorage.getItem('lumina_pomo_section_state');
+    if (savedPomoSectionState !== null) {
+      const state = savedPomoSectionState as any;
+      setPomoSectionState(state === 'default' ? 'expanded' : state);
+    }
+
+    const savedReminderSectionState = localStorage.getItem('lumina_reminder_section_state');
+    if (savedReminderSectionState !== null) {
+      const state = savedReminderSectionState as any;
+      setReminderSectionState(state === 'default' ? 'expanded' : state);
+    }
+
+    const savedPrefs = localStorage.getItem('lumina_prefs');
+    if (savedPrefs) {
+      const prefs = JSON.parse(savedPrefs);
+      setSelectedCountry(prefs.country || 'United States');
+      setPrefLength(prefs.length || 'inch');
+      setPrefWeight(prefs.weight || 'lb');
+      setPrefCurrency(prefs.currency || 'USD');
+      setPrefTemperature(prefs.temperature || 'degF');
+      setPrefTimezone(prefs.timezone || 'America/New_York');
+      setPrefNumberFormat(prefs.numberFormat || '1,234.56');
+      setPrefDateFormat(prefs.dateFormat || 'MM/DD/YYYY');
+      setPrefTimeFormat(prefs.timeFormat || '12h');
+      setPrefPomoFocus(prefs.pomoFocus || 25);
+      setPrefPomoBreak(prefs.pomoBreak || 5);
+      setPrefFocusSound(prefs.focusSound ?? prefs.pomoSound ?? true);
+      setPrefNotificationSound(prefs.notificationSound ?? true);
+      setPrefPomoAutoStart(prefs.pomoAutoStart ?? true);
+    }
+
+    // Global shortcut listener
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+Q to toggle bubble
+      if ((e.ctrlKey || e.metaKey) && e.key === 'q') {
+        e.preventDefault();
+        setIsExpanded(prev => {
+          const next = !prev;
+          if (next) {
+            setIsUserExpanded(false); // Always start minimalist when opened via shortcut
+            setShowSettings(false);
+            // Focus input on next tick
+            setTimeout(() => inputRef.current?.focus(), 50);
+          }
+          return next;
+        });
+        setLastActionTime(Date.now());
+      }
+      if (e.key === 'Escape') {
+        setIsExpanded(false);
+        setShowSettings(false);
+        setIsUserExpanded(false);
+      }
+    };
+
+    // Click outside app to collapse
+    const handleClickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setIsExpanded(false);
+        setShowSettings(false);
+        setIsUserExpanded(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleClickOutside);
+
+    // Listen for Tauri global shortcut event
+    let unlistenFn: (() => void) | null = null;
+    if (isDesktopApp()) {
+      listen('shortcut-show', () => {
+        setIsExpanded(true);
+        setIsUserExpanded(false);
+        setShowSettings(false);
+        // Focus input on next tick
+        setTimeout(() => inputRef.current?.focus(), 100);
+        setLastActionTime(Date.now());
+      }).then((unlisten) => {
+        unlistenFn = unlisten;
+      });
+    }
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleClickOutside);
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
+
+  // Auto-hide logic
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Do not auto-hide if fetching or if settings are open
+      if (isExpanded && !isLoading && !showSettings && Date.now() - lastActionTime > 180000) { 
+        setIsExpanded(false);
+      }
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [isExpanded, lastActionTime, isLoading, showSettings]);
+
+  // Poll whether the log CSV is locked by another app (e.g. Excel)
+  useEffect(() => {
+    if (!isExpanded) { setIsLogLocked(false); return; }
+    const check = async () => {
+      const writable = await isLogWritable();
+      setIsLogLocked(!writable);
+      if (writable) flushLogQueue(); // flush any queued writes from lock period
+    };
+    check();
+    const interval = setInterval(check, 3000);
+    return () => clearInterval(interval);
+  }, [isExpanded]);
+
+  // Save state
+  useEffect(() => {
+    localStorage.setItem('lumina_reminders', JSON.stringify(reminders));
+  }, [reminders]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomos', JSON.stringify(pomoList));
+  }, [pomoList]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_api_keys', JSON.stringify(apiKeys));
+  }, [apiKeys]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_ai_enabled', JSON.stringify(isAiEnabled));
+  }, [isAiEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_prefs', JSON.stringify({
+      country: selectedCountry,
+      length: prefLength,
+      weight: prefWeight,
+      currency: prefCurrency,
+      temperature: prefTemperature,
+      timezone: prefTimezone,
+      numberFormat: prefNumberFormat,
+      dateFormat: prefDateFormat,
+      timeFormat: prefTimeFormat,
+      pomoFocus: prefPomoFocus,
+      pomoBreak: prefPomoBreak,
+      focusSound: prefFocusSound,
+      notificationSound: prefNotificationSound,
+      pomoAutoStart: prefPomoAutoStart
+    }));
+  }, [selectedCountry, prefLength, prefWeight, prefCurrency, prefTemperature, prefTimezone, prefNumberFormat, prefDateFormat, prefTimeFormat, prefPomoFocus, prefPomoBreak, prefFocusSound, prefNotificationSound, prefPomoAutoStart]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_provider', selectedProvider);
+  }, [selectedProvider]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_custom_endpoint', customEndpoint);
+  }, [customEndpoint]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_location', location);
+  }, [location]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_history', JSON.stringify(messages));
+  }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_is_expanded', JSON.stringify(isExpanded));
+  }, [isExpanded]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_is_user_expanded', JSON.stringify(isUserExpanded));
+  }, [isUserExpanded]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_time', JSON.stringify(pomoTime));
+  }, [pomoTime]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_active', JSON.stringify(isPomoActive));
+  }, [isPomoActive]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_mode', pomoMode);
+  }, [pomoMode]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_total_time', JSON.stringify(pomoTotalTime));
+  }, [pomoTotalTime]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_name', pomoName);
+  }, [pomoName]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_pomo_section_state', pomoSectionState);
+  }, [pomoSectionState]);
+
+  useEffect(() => {
+    localStorage.setItem('lumina_reminder_section_state', reminderSectionState);
+  }, [reminderSectionState]);
+
+  // Scroll to bottom
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, isLoading]);
+
+  // Resize window and toggle click-through based on expanded state
+  useEffect(() => {
+    if (isDesktopApp()) {
+      if (isExpanded) {
+        // Expanded state: full size and interactive
+        resizeWindow(420, 700);
+        setIgnoreCursorEvents(false);
+      } else {
+        // Collapsed state: tiny bubble, click-through so it doesn't block other apps
+        resizeWindow(80, 120);
+        setIgnoreCursorEvents(true);
+      }
+    }
+  }, [isExpanded]);
+
+  // Reminder trigger logic
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = new Date();
+      const triggeredReminders = reminders.filter(r => !r.completed && r.time && isAfter(now, parseISO(r.time)));
+
+      if (triggeredReminders.length > 0) {
+        // Play notification sound and show native notification
+        if (prefNotificationSound) {
+          playNotificationSound();
+        }
+
+        triggeredReminders.forEach(reminder => {
+          // Show native OS notification (reminder only, does NOT auto-complete)
+          showNotification('Lumina Reminder', reminder.task);
+          // Add to conversation
+          const reminderMsg: Message = {
+            role: 'assistant',
+            content: `🔔 **Reminder:** ${reminder.task}`,
+            type: 'reminder',
+            metadata: { time: reminder.time }
+          };
+          setMessages(prev => [...prev, reminderMsg]);
+        });
+
+        // Expand widget to show notification
+        setIsExpanded(true);
+        setIsUserExpanded(true);
+        setLastActionTime(Date.now());
+      }
+    }, 10000); // Check every 10 seconds
+
+    return () => clearInterval(interval);
+  }, [reminders, isExpanded]);
+
+  // Pomodoro logic
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isPomoActive && pomoTime > 0) {
+      interval = setInterval(() => {
+        setPomoTime(prev => prev - 1);
+      }, 1000);
+    } else if (isPomoActive && pomoTime === 0) {
+      setIsPomoActive(false);
+      if (prefNotificationSound) {
+        playNotificationSound();
+      }
+
+      const nextMode = pomoMode === 'work' ? 'break' : 'work';
+      showNotification('Lumina Pomodoro', `Time for a ${nextMode}!`);
+      const nextDuration = nextMode === 'work' ? prefPomoFocus : prefPomoBreak;
+      const nextTime = nextDuration * 60;
+      const now = new Date();
+      
+      // Log completed work sessions only (skip breaks)
+      if (pomoMode === 'work') {
+        appendLog({
+          id: genLogId(),
+          date: fmtDate(now),
+          name: pomoName,
+          type: 'pomo',
+          duration: String(Math.round(pomoTotalTime / 60)),
+          start_time: fmtISOtoTime(pomoStartTime),
+          end_time: fmtTime(now),
+          status: 'completed',
+          pause_count: pomoPausesUsed,
+        });
+      }
+
+      // Update finished count if work mode
+      if (pomoMode === 'work') {
+        setPomoList(prev => prev.map(p => {
+          if (p.isActive) {
+            const isCounted = (p.pausesUsed || 0) <= 3;
+            return { 
+              ...p, 
+              finishedCount: (p.finishedCount || 0) + (isCounted ? 1 : 0),
+              pausesUsed: 0,
+            };
+          }
+          return p;
+        }));
+      }
+
+      const pomoMsg: Message = {
+        role: 'assistant',
+        content: `🍅 **Pomodoro Finished!** Time for a ${nextMode}.`,
+        type: 'reminder'
+      };
+      setMessages(prev => [...prev, pomoMsg]);
+      
+      setPomoMode(nextMode);
+      setPomoTime(nextTime);
+      setPomoTotalTime(nextTime);
+
+      if (prefPomoAutoStart) {
+        const nowISO = now.toISOString();
+        setPomoStartTime(nowISO);
+        setPomoPausesUsed(0);
+        setPomoList(prev => prev.map(p => 
+          p.isActive ? { ...p, startTime: nowISO, mode: nextMode, totalTime: nextTime } : p
+        ));
+        setIsPomoActive(true);
+      }
+      
+      setIsExpanded(true);
+      setIsUserExpanded(true);
+    }
+    return () => clearInterval(interval);
+  }, [isPomoActive, pomoTime, pomoMode]);
+
+  // Focus sound (ticking) logic
+  useEffect(() => {
+    let audioContext: AudioContext | null = null;
+    let interval: NodeJS.Timeout | null = null;
+
+    if (isPomoActive && pomoMode === 'work' && prefFocusSound && prefNotificationSound) {
+      audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      
+      const playTick = () => {
+        if (!audioContext) return;
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(800, audioContext.currentTime);
+        gain.gain.setValueAtTime(0.05, audioContext.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.05);
+        osc.connect(gain);
+        gain.connect(audioContext.destination);
+        osc.start();
+        osc.stop(audioContext.currentTime + 0.05);
+      };
+
+      interval = setInterval(playTick, 1000);
+    }
+
+    return () => {
+      if (interval) clearInterval(interval);
+      if (audioContext) audioContext.close();
+    };
+  }, [isPomoActive, pomoMode, prefFocusSound, prefNotificationSound]);
+
+  const handleCountryChange = (country: string) => {
+    setSelectedCountry(country);
+    const preset = COUNTRY_PRESETS[country];
+    if (preset) {
+      setPrefLength(preset.length);
+      setPrefWeight(preset.weight);
+      setPrefCurrency(preset.currency);
+      setPrefTemperature(preset.temperature);
+      setPrefTimezone(preset.timezone);
+      setPrefNumberFormat(preset.numberFormat);
+      setPrefDateFormat(preset.dateFormat);
+      setPrefTimeFormat(preset.timeFormat || '12h');
+    }
+  };
+
+  // Date/time format helpers for CSV logging
+  const fmtDate = (d: Date) => d.toISOString().slice(0, 10);          // YYYY-MM-DD
+  const fmtTime = (d: Date) => d.toTimeString().slice(0, 5);          // HH:MM
+  const fmtISOtoDate = (iso: string) => fmtDate(new Date(iso));
+  const fmtISOtoTime = (iso: string) => fmtTime(new Date(iso));
+  const genLogId = () => { const id = nextLogIdRef.current; nextLogIdRef.current = id + 1; setNextLogId(id + 1); return id; };
+
+  const parseTimeInfo = (text: string) => {
+    // 1130am, 11:30am, 11:30, 2300, 23:00
+    // Must have am/pm, or a colon, or be 3-4 digits (like 2300)
+    const timeRegex = /\b(\d{1,2})[:](\d{2})\s*(am|pm)?\b|\b(\d{1,2})\s*(am|pm)\b|\b(\d{3,4})\b/i;
+    // 15m, 1h
+    const relativeRegex = /\b(\d+)\s*(m|min|h|hour)s?\b/i;
+
+    const relMatch = text.match(relativeRegex);
+    if (relMatch) {
+      const value = parseInt(relMatch[1]);
+      const unit = relMatch[2].toLowerCase();
+      const now = new Date();
+      if (unit.startsWith('m')) now.setMinutes(now.getMinutes() + value);
+      else now.setHours(now.getHours() + value);
+      return { 
+        time: now.toISOString(), 
+        task: text.replace(relMatch[0], '').trim(),
+        found: true
+      };
+    }
+
+    const timeMatch = text.match(timeRegex);
+    if (timeMatch) {
+      if (text.trim() === timeMatch[0].trim() && !timeMatch[3] && !timeMatch[5] && !text.includes(':')) {
+         return { task: text, found: false };
+      }
+
+      let hours = 0;
+      let minutes = 0;
+      let ampm = '';
+
+      if (timeMatch[1]) {
+        hours = parseInt(timeMatch[1]);
+        minutes = parseInt(timeMatch[2]);
+        ampm = timeMatch[3]?.toLowerCase();
+      } else if (timeMatch[4]) {
+        hours = parseInt(timeMatch[4]);
+        ampm = timeMatch[5]?.toLowerCase();
+      } else if (timeMatch[6]) {
+        const val = timeMatch[6];
+        if (val.length === 3) {
+          hours = parseInt(val[0]);
+          minutes = parseInt(val.slice(1));
+        } else {
+          hours = parseInt(val.slice(0, 2));
+          minutes = parseInt(val.slice(2));
+        }
+      }
+
+      if (ampm === 'pm' && hours < 12) hours += 12;
+      if (ampm === 'am' && hours === 12) hours = 0;
+
+      if (hours > 23 || minutes > 59) return { task: text, found: false };
+
+      const now = new Date();
+      const target = new Date();
+      target.setHours(hours, minutes, 0, 0);
+
+      if (target < now) {
+        target.setDate(target.getDate() + 1);
+      }
+
+      return { 
+        time: target.toISOString(), 
+        task: text.replace(timeMatch[0], '').trim(),
+        found: true
+      };
+    }
+
+    return { task: text, found: false };
+  };
+
+  const handleSubmit = async (e?: React.FormEvent, retryText?: string) => {
+    e?.preventDefault();
+    const userQuery = retryText || query;
+    if (!userQuery.trim() || isLoading) return;
+
+    if (!retryText) setQuery('');
+    setLastActionTime(Date.now());
+    
+    // Handle /todo command
+    let processedQuery = userQuery;
+    if (processedQuery.startsWith('/todo ')) {
+      const rawTask = processedQuery.slice(6).trim();
+      
+      // Time detection logic
+      const timeInfo = parseTimeInfo(rawTask);
+
+      if (!isAiEnabled) {
+        const logId = genLogId();
+        const createdDate = new Date();
+        const newReminder: Reminder = {
+          id: Math.random().toString(36).substr(2, 9),
+          task: timeInfo.task,
+          time: timeInfo.found ? timeInfo.time : undefined,
+          completed: false,
+          noTime: !timeInfo.found,
+          createdAt: createdDate.toISOString(),
+          logId,
+        };
+        setReminders(prev => [...prev, newReminder]);
+        
+        // Log todo creation (pending)
+        appendLog({
+          id: logId,
+          date: fmtDate(createdDate),
+          name: timeInfo.task,
+          type: 'todo',
+          duration: '',
+          start_time: fmtTime(createdDate),
+          end_time: '',
+          status: 'pending',
+          pause_count: 0,
+        });
+        
+        let displayTime = '';
+        if (timeInfo.found) {
+          const date = parseISO(timeInfo.time!);
+          displayTime = ` at ${format(date, prefTimeFormat === '12h' ? 'h:mm a' : 'HH:mm')}`;
+        }
+
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          content: `✅ **Todo added (Free Mode):** ${timeInfo.task}${displayTime}`, 
+          type: 'reminder' 
+        }]);
+        return;
+      }
+      processedQuery = `I want to set a reminder. Task and time info: ${rawTask}. 
+      Please respond with:
+      - For specific time: REMINDER_TASK: [task] REMINDER_TIME: [ISO time]
+      - For no time (todo): REMINDER_TASK: [task] REMINDER_TIME: NONE
+      - For whole day: REMINDER_TASK: [task] REMINDER_TIME: [ISO date] REMINDER_ALLDAY: TRUE`;
+    }
+
+    // Handle /pomo command
+    if (processedQuery.trim().toLowerCase().startsWith('/pomo')) {
+      const parts = processedQuery.slice(5).trim().split(' ');
+      let duration = prefPomoFocus;
+      let name = 'Focus Session';
+
+      if (parts.length > 0) {
+        const lastPart = parts[parts.length - 1];
+        // Only treat as duration if there's more than one part OR if it's clearly not just a name
+        if (parts.length > 1 && !isNaN(parseInt(lastPart)) && /^\d+$/.test(lastPart)) {
+          duration = parseInt(lastPart);
+          name = parts.slice(0, -1).join(' ') || 'Focus Session';
+        } else {
+          name = parts.join(' ') || 'Focus Session';
+        }
+      }
+
+      const durationSec = duration * 60;
+      const newPomo: Pomo = {
+        id: Math.random().toString(36).substr(2, 9),
+        name: name,
+        duration: durationSec,
+        totalTime: durationSec,
+        mode: 'work',
+        isActive: true,
+        finishedCount: 0,
+        pausesUsed: 0,
+        startTime: new Date().toISOString(),
+      };
+      
+      setPomoList(prev => [newPomo, ...prev.map(p => ({ ...p, isActive: false }))]);
+      setIsPomoActive(true);
+      setPomoTime(durationSec);
+      setPomoTotalTime(durationSec);
+      setPomoMode('work');
+      setPomoName(name);
+      setPomoStartTime(new Date().toISOString());
+      setPomoPausesUsed(0);
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: `🍅 **Pomodoro started: ${name}!** ${duration} minutes of focus begins now.`, 
+        type: 'answer' 
+      }]);
+      setQuery('');
+      setIsUserExpanded(true);
+      return;
+    }
+
+    // Handle /help command
+    if (processedQuery.trim().toLowerCase().startsWith('/help')) {
+      const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+      setMessages([...updatedMessages, { 
+        role: 'assistant', 
+        content: `🛠️ **Available Commands:**
+- \`/pomo [name]\`: Start a 25m focus session
+- \`/todo [task]\`: Add a quick reminder
+- \`/num [expression]\`: Perform calculations (e.g., \`/num 12 x 45\`)
+- \`/tobe [value] to [unit]\` or \`/tobe [value]=[unit]\`: Convert units (e.g., \`/tobe 10km to miles\`, \`/tobe 100degF=degC\`)
+- \`/time [timezone]\`: Show current time (e.g., \`/time Europe/London\`)
+- \`/help\`: Show this list
+
+*Note: In Free Mode, any non-command input will be treated as a conversion attempt.*`, 
+        type: 'answer' 
+      }]);
+      setIsUserExpanded(true);
+      return;
+    }
+
+    // Handle /time command
+    if (processedQuery.trim().toLowerCase().startsWith('/time')) {
+      const input = processedQuery.slice(5).trim();
+      const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+      
+      if (!input) {
+        const localTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const localDate = new Date().toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        setMessages([...updatedMessages, { 
+          role: 'assistant', 
+          content: `🕒 **Local Time:** ${localTime}\n📅 **Date:** ${localDate}`, 
+          type: 'answer' 
+        }]);
+        setIsUserExpanded(true);
+        return;
+      }
+
+      // Try to get world time
+      setIsLoading(true);
+      try {
+        let displayTime = '';
+        let locationName = input;
+
+        // 1. Check for GMT/UTC offset (e.g., GMT+9, UTC-5, +8)
+        const offsetMatch = input.match(/^(?:gmt|utc)?\s*([+-]\d+(?:\.\d+)?)$/i);
+        if (offsetMatch) {
+          const offset = parseFloat(offsetMatch[1]);
+          const now = new Date();
+          const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+          const targetDate = new Date(utc + (3600000 * offset));
+          
+          const timeStr = targetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          const dateStr = targetDate.toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+          displayTime = `${timeStr}\n📅 **Date:** ${dateStr}`;
+          locationName = `GMT${offset >= 0 ? '+' : ''}${offset}`;
+        } else {
+          // 2. Check city mapping or direct IANA string
+          const mappedTz = CITY_TO_TIMEZONE[input.toLowerCase()];
+          const tzToUse = mappedTz || input.replace(/\s+/g, '_');
+
+          try {
+            const formatter = new Intl.DateTimeFormat([], {
+              timeZone: tzToUse,
+              hour: '2-digit', minute: '2-digit', second: '2-digit',
+              weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+            });
+            displayTime = formatter.format(new Date());
+            // Use the formatted city name if it was in our mapping
+            if (mappedTz) {
+              locationName = input.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+            }
+          } catch (e) {
+            throw new Error(`Could not find timezone for "${input}"`);
+          }
+        }
+
+        setMessages([...updatedMessages, { 
+          role: 'assistant', 
+          content: `🌍 **Time in ${locationName}:** ${displayTime}`, 
+          type: 'answer' 
+        }]);
+      } catch (e) {
+        setMessages([...updatedMessages, { 
+          role: 'assistant', 
+          content: `❌ **Error:** Could not find timezone for "${input}". Try cities like "Paris", "Tokyo", or offsets like "GMT+9".`, 
+          type: 'error' 
+        }]);
+      }
+      setIsLoading(false);
+      setIsUserExpanded(true);
+      return;
+    }
+
+    // Handle /num and /tobe (Free Mode or explicit command)
+    const isNum = processedQuery.trim().toLowerCase().startsWith('/num ');
+    const isToBe = processedQuery.trim().toLowerCase().startsWith('/tobe ');
+    
+    if (isNum || isToBe || processedQuery.trim().length > 0) {
+      let expression = isNum ? processedQuery.slice(5) : isToBe ? processedQuery.slice(6) : processedQuery;
+      
+      // Normalize expression
+      expression = expression.replace(/\bmil\b/gi, 'mile');
+      // Temperature normalization (Source)
+      expression = expression.replace(/(\d+(?:\.\d+)?)\s*(?:degc|c|℃|celsius)\b/gi, '$1 degC');
+      expression = expression.replace(/(\d+(?:\.\d+)?)\s*(?:degf|f|℉|fahrenheit)\b/gi, '$1 degF');
+      expression = expression.replace(/(\d+(?:\.\d+)?)\s*(?:k|kelvin)\b/gi, '$1 kelvin');
+      // Temperature normalization (Target)
+      expression = expression.replace(/(?:to|=)\s*(?:degc|c|℃|celsius)\b/gi, 'to degC');
+      expression = expression.replace(/(?:to|=)\s*(?:degf|f|℉|fahrenheit)\b/gi, 'to degF');
+      expression = expression.replace(/(?:to|=)\s*(?:k|kelvin)\b/gi, 'to kelvin');
+
+      // For /num, allow 'x' and 'X' as multiply
+      if (isNum) {
+        expression = expression.replace(/[xX]/g, '*');
+      }
+
+      // Handle [value]=[unit] format (for both /tobe and auto-detection)
+      if (expression.includes('=') && !isNum) {
+        const parts = expression.split('=');
+        if (parts.length === 2) {
+          const value = parts[0].trim();
+          const targetUnit = parts[1].trim();
+          expression = `${value} to ${targetUnit}`;
+        }
+      }
+
+      // Currency conversion logic
+      const currencyRegex = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${CURRENCY_CODES.join('|')})\\s*(?:to|\\s+to\\s+|=)\\s*(${CURRENCY_CODES.join('|')})`, 'i');
+      const currencyMatch = expression.match(currencyRegex);
+
+      if (currencyMatch && !isNum) {
+        const amount = parseFloat(currencyMatch[1]);
+        const from = currencyMatch[2].toUpperCase();
+        const to = currencyMatch[3].toUpperCase();
+        
+        if (exchangeRates[from] && exchangeRates[to]) {
+          const result = (amount / exchangeRates[from]) * exchangeRates[to];
+          const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+          setMessages([...updatedMessages, { 
+            role: 'assistant', 
+            content: `💱 **Currency Conversion:** ${amount} ${from} = **${result.toFixed(2)} ${to}**`, 
+            type: 'answer' 
+          }]);
+          setIsUserExpanded(true);
+          return;
+        }
+      }
+
+      // Auto-convert single currency if no target specified
+      const singleCurrencyRegex = new RegExp(`^(\\d+(?:\\.\\d+)?)\\s*(${CURRENCY_CODES.join('|')})$`, 'i');
+      const singleCurrencyMatch = expression.trim().match(singleCurrencyRegex);
+      if (singleCurrencyMatch && !isNum) {
+        const amount = parseFloat(singleCurrencyMatch[1]);
+        const from = singleCurrencyMatch[2].toUpperCase();
+        const to = prefCurrency;
+        
+        if (from !== to && exchangeRates[from] && exchangeRates[to]) {
+          const result = (amount / exchangeRates[from]) * exchangeRates[to];
+          const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+          setMessages([...updatedMessages, { 
+            role: 'assistant', 
+            content: `💱 **Currency Conversion:** ${amount} ${from} = **${result.toFixed(2)} ${to}**`, 
+            type: 'answer' 
+          }]);
+          setIsUserExpanded(true);
+          return;
+        }
+      }
+
+      try {
+        // Try to evaluate as math/conversion
+        let result = math.evaluate(expression);
+        
+        if (result !== undefined && typeof result !== 'function') {
+          const isUnit = math.typeOf(result) === 'Unit';
+          
+          // Auto-convert single units if no target specified
+          if (isUnit && !expression.toLowerCase().includes(' to ')) {
+            let targetUnit = '';
+            if (result.equalBase(math.unit('1m'))) targetUnit = prefLength;
+            else if (result.equalBase(math.unit('1kg'))) targetUnit = prefWeight;
+            else if (result.equalBase(math.unit('1degC'))) targetUnit = prefTemperature;
+            
+            if (targetUnit) {
+              result = result.to(targetUnit);
+            }
+          }
+
+          // Format result to 2 decimal places
+          const resultStr = math.format(result, { notation: 'fixed', precision: 2 });
+          
+          // Show result if:
+          // 1. Explicit command (/num, /tobe)
+          // 2. AI is disabled
+          // 3. It's a unit (auto-detected conversion)
+          if (isNum || isToBe || !isAiEnabled || isUnit) {
+            const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+            setMessages([...updatedMessages, { 
+              role: 'assistant', 
+              content: `🔢 **Result:** ${resultStr}`, 
+              type: 'answer' 
+            }]);
+            setIsUserExpanded(true);
+            return;
+          }
+        }
+      } catch (e) {
+        // If explicit command failed, show error
+        if (isNum || isToBe) {
+          const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+          setMessages([...updatedMessages, { 
+            role: 'assistant', 
+            content: `❌ **Error:** Could not evaluate expression. Please check your syntax.`, 
+            type: 'error' 
+          }]);
+          setIsUserExpanded(true);
+          return;
+        }
+        // Fall through to AI
+      }
+    }
+
+    const updatedMessages: Message[] = retryText ? messages : [...messages, { role: 'user', content: userQuery }];
+    if (!retryText) setMessages(updatedMessages);
+    
+    if (!isAiEnabled) {
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: "AI mode is currently disabled. You can use `/pomo` or `/todo` commands, or enable AI in Settings to chat.", 
+        type: 'answer' 
+      }]);
+      return;
+    }
+
+    setIsLoading(true);
+    setIsTimeout(false);
+    setPendingQuery(userQuery);
+    setIsExpanded(true); 
+    setIsUserExpanded(true); 
+
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      setIsTimeout(true);
+    }, 20000); // 20 second timeout
+
+    try {
+      const result = await callAI(processedQuery, updatedMessages, selectedProvider, apiKeys, location, customEndpoint);
+      
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      
+      setMessages(prev => [...prev, result]);
+      setIsLoading(false);
+      setIsTimeout(false);
+      setPendingQuery(null);
+
+      if (result.type === 'reminder') {
+        const logId = genLogId();
+        const createdDate = new Date();
+        const newReminder: Reminder = {
+          id: Math.random().toString(36).substr(2, 9),
+          task: result.metadata?.task || result.content,
+          time: result.metadata?.time,
+          isAllDay: result.metadata?.isAllDay,
+          noTime: result.metadata?.noTime,
+          completed: false,
+          createdAt: createdDate.toISOString(),
+          logId,
+        };
+        setReminders(prev => [...prev, newReminder]);
+
+        // Log todo creation (pending)
+        appendLog({
+          id: logId,
+          date: fmtDate(createdDate),
+          name: newReminder.task,
+          type: 'todo',
+          duration: '',
+          start_time: fmtTime(createdDate),
+          end_time: '',
+          status: 'pending',
+          pause_count: 0,
+        });
+      }
+    } catch (error) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      setIsLoading(false);
+      setIsTimeout(false);
+      setPendingQuery(null);
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Failed to fetch response. Please check your API key or connection.', type: 'error' }]);
+    }
+  };
+
+  const handleRetry = () => {
+    if (pendingQuery) {
+      handleSubmit(undefined, pendingQuery);
+    }
+  };
+
+  const handleCancel = () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    setIsLoading(false);
+    setIsTimeout(false);
+    setPendingQuery(null);
+  };
+
+  const clearConversation = () => {
+    setMessages([]);
+    localStorage.removeItem('lumina_history');
+    setLastActionTime(Date.now());
+  };
+
+  const togglePomo = (id: string) => {
+    setPomoList(prev => prev.map(p => {
+      if (p.id === id) {
+        const nextActive = !p.isActive;
+        if (nextActive) {
+          const nowISO = new Date().toISOString();
+          setIsPomoActive(true);
+          setPomoTime(p.duration);
+          setPomoTotalTime(p.totalTime);
+          setPomoMode(p.mode);
+          setPomoName(p.name);
+          setPomoStartTime(nowISO);
+          setPomoPausesUsed(0);
+          return { ...p, isActive: true, pausesUsed: 0, startTime: nowISO };
+        } else {
+          setIsPomoActive(false);
+          return { ...p, isActive: false };
+        }
+      }
+      return { ...p, isActive: false };
+    }));
+  };
+
+  const pausePomo = () => {
+    if (isPomoActive) {
+      setIsPomoActive(false);
+      setPomoPausesUsed(prev => prev + 1);
+      setPomoList(prev => prev.map(p => {
+        if (p.isActive) {
+          return { ...p, pausesUsed: (p.pausesUsed || 0) + 1 };
+        }
+        return p;
+      }));
+    } else {
+      setIsPomoActive(true);
+    }
+  };
+
+  const restartPomo = () => {
+    const active = pomoList.find(p => p.isActive);
+    if (active) {
+      if (active.mode === 'work') {
+        const now = new Date();
+        appendLog({
+          id: genLogId(),
+          date: fmtDate(now),
+          name: pomoName,
+          type: 'pomo',
+          duration: String(Math.round(pomoTotalTime / 60)),
+          start_time: fmtISOtoTime(pomoStartTime),
+          end_time: fmtTime(now),
+          status: 'cancelled',
+          pause_count: pomoPausesUsed,
+        });
+      }
+      const nowISO = new Date().toISOString();
+      setPomoTime(active.totalTime);
+      setIsPomoActive(false);
+      setPomoStartTime(nowISO);
+      setPomoPausesUsed(0);
+      setPomoList(prev => prev.map(p => p.isActive ? { ...p, pausesUsed: 0, startTime: nowISO } : p));
+    }
+  };
+
+  const deletePomo = (id: string) => {
+    setPomoList(prev => {
+      const p = prev.find(item => item.id === id);
+      if (p) {
+        if (p.isActive) setIsPomoActive(false);
+        if (p.mode === 'work') {
+          const now = new Date();
+          appendLog({
+            id: genLogId(),
+            date: fmtDate(now),
+            name: pomoName,
+            type: 'pomo',
+            duration: String(Math.round(pomoTotalTime / 60)),
+            start_time: fmtISOtoTime(pomoStartTime),
+            end_time: fmtTime(now),
+            status: 'cancelled',
+            pause_count: pomoPausesUsed,
+          });
+        }
+      }
+      return prev.filter(item => item.id !== id);
+    });
+  };
+
+  const togglePomoSection = () => {
+    setPomoSectionState(prev => prev === 'expanded' ? 'collapsed' : 'expanded');
+  };
+
+  const toggleReminderSection = () => {
+    setReminderSectionState(prev => prev === 'expanded' ? 'collapsed' : 'expanded');
+  };
+
+  const deleteReminder = (id: string) => {
+    setReminders(prev => prev.filter(r => r.id !== id));
+    if (editingReminderId === id) setEditingReminderId(null);
+    setLastActionTime(Date.now());
+  };
+
+  const startEditingReminder = (r: Reminder) => {
+    setEditingReminderId(r.id);
+    setEditingReminderValue(r.task);
+    setEditingReminderTimeValue(r.noTime ? '' : r.time ? format(parseISO(r.time), prefTimeFormat === '12h' ? 'h:mm a' : 'HH:mm') : '');
+  };
+
+  const saveReminderEdit = (id: string) => {
+    const timeInfo = parseTimeInfo(editingReminderTimeValue);
+    setReminders(prev => prev.map(r => {
+      if (r.id === id) {
+        // Sync renamed task to the log CSV
+        if (r.logId && editingReminderValue !== r.task) {
+          updateLog(r.logId, '', '', editingReminderValue);
+        }
+        return { 
+          ...r, 
+          task: editingReminderValue,
+          time: timeInfo.found ? timeInfo.time : r.time,
+          noTime: !timeInfo.found && !editingReminderTimeValue.trim() ? true : timeInfo.found ? false : r.noTime
+        };
+      }
+      return r;
+    }));
+    setEditingReminderId(null);
+    setLastActionTime(Date.now());
+  };
+
+  const toggleReminder = (id: string) => {
+    setReminders(prev => prev.map(r => {
+      if (r.id === id) {
+        const nextCompleted = !r.completed;
+        // Log when a todo is completed
+        if (nextCompleted && r.logId) {
+          updateLog(r.logId, fmtTime(new Date()), 'completed', r.task);
+        }
+        return { ...r, completed: nextCompleted };
+      }
+      return r;
+    }));
+    setLastActionTime(Date.now());
+  };
+
+  const formatPomoTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const updateApiKey = (provider: string, key: string) => {
+    setApiKeys(prev => ({ ...prev, [provider]: key }));
+  };
+
+  const providers: { id: AIProvider; name: string; icon: React.ReactNode }[] = [
+    { id: 'gemini', name: 'Gemini', icon: <Sparkles className="w-4 h-4" /> },
+    { id: 'openai', name: 'GPT-4o', icon: <Cpu className="w-4 h-4" /> },
+    { id: 'anthropic', name: 'Claude 3.5', icon: <Cpu className="w-4 h-4" /> },
+    { id: 'deepseek', name: 'DeepSeek', icon: <Cpu className="w-4 h-4" /> },
+    { id: 'kimi', name: 'Kimi', icon: <Cpu className="w-4 h-4" /> },
+    { id: 'custom', name: 'Custom', icon: <Settings className="w-4 h-4" /> },
+  ];
+
+  const showHistory = isUserExpanded;
 
   return (
     <div ref={containerRef} className="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-4">

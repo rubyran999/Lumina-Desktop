@@ -69,9 +69,16 @@
 
 ## Technical Debt
 
-- [ ] `src/App.tsx` is ~2,200 lines — split into components (PomoPanel, ReminderPanel, ChatPanel, SettingsPanel, Header)
-- [ ] Extract business logic into custom hooks (`usePomodoro`, `useReminders`, `useLogger`)
-- [ ] `tsconfig.json` missing `exclude` for `src-tauri/target/` (causes spurious TS errors on `tsc --noEmit`)
-- [ ] CSV parsing in Rust (`split(',')`) doesn't handle quoted fields with commas — replace with a proper CSV crate
-- [ ] Remove retry logic in Rust if queue approach proves sufficient
-- [ ] Add unit tests for Rust `logging` module
+- [x] `src/App.tsx` — refactored from 2,243 lines to 953 lines; now calls `useCore()` instead of duplicating all logic
+- [x] Extract business logic into custom hooks — 5 hooks created (1,527 → distributed across `_core.tsx` + 5 files):
+  - `usePomodoro.tsx` (327 lines) — timer, tick sound, 7 actions, persistence
+  - `useReminders.tsx` (262 lines) — state, 10s trigger, 5 actions, `parseTimeInfo`, `addReminder`
+  - `useChat.tsx` (69 lines) — chat state, history, scroll-to-bottom
+  - `useLogger.tsx` (53 lines) — log init, lock polling, `genLogId`/`fmtDate`/etc.
+  - `useSettings.tsx` (222 lines) — 14 prefs, AI config, exchange rates, providers
+  - `_core.tsx` (594 lines) — UI state + `handleSubmit` orchestrator (was 1,302)
+- [x] `doc/CODE_MAP.txt` created — plain-English map of files by bug type (234 lines)
+- [x] `tsconfig.json` missing `exclude` for `src-tauri/target/` (causes spurious TS errors on `tsc --noEmit`)
+- [x] CSV parsing in Rust (`split(',')`) doesn't handle quoted fields with commas — replace with a proper CSV crate
+- [x] Remove retry logic in Rust if queue approach proves sufficient
+- [x] Add unit tests for Rust `logging` module

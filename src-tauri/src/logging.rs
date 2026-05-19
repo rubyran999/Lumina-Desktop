@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use tauri::Manager;
+use csv::{ReaderBuilder, WriterBuilder};
 
 const LOG_FILENAME: &str = "lumina_log.csv";
 const CSV_HEADER: &str = "id,date,type,name,duration,start_time,end_time,status,pause_count\n";
@@ -51,26 +52,6 @@ pub fn check_log_writable(app: tauri::AppHandle) -> Result<bool, String> {
     }
 }
 
-/// Retry a write operation up to 5 times with backoff (handles Excel file locks).
-fn retry_write<F, T, E>(mut action: F) -> Result<T, String>
-where
-    F: FnMut() -> Result<T, E>,
-    E: std::fmt::Display,
-{
-    for attempt in 0..5 {
-        match action() {
-            Ok(val) => return Ok(val),
-            Err(e) if attempt < 4 => {
-                let _ = e; // file locked, will retry
-                let ms = 150 * (attempt + 1);
-                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-            }
-            Err(e) => return Err(format!("Failed after 5 retries: {}", e)),
-        }
-    }
-    unreachable!()
-}
-
 /// Escape a string for CSV (wrap in quotes if contains comma, quote, or newline).
 fn csv_escape(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
@@ -94,8 +75,12 @@ pub fn get_next_log_id(app: tauri::AppHandle) -> Result<u32, String> {
         .map_err(|e| format!("Failed to read log file: {}", e))?;
 
     let mut max_id: u32 = 0;
-    for line in content.lines().skip(1) {
-        if let Some(first) = line.split(',').next() {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(content.as_bytes());
+    for result in rdr.records() {
+        let record = result.map_err(|e| format!("CSV parse error: {}", e))?;
+        if let Some(first) = record.get(0) {
             if let Ok(id) = first.trim().parse::<u32>() {
                 if id > max_id { max_id = id; }
             }
@@ -134,14 +119,12 @@ pub fn append_log(
         pause_count,
     );
 
-    retry_write(|| {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("Log file locked: {}", e))?;
-        file.write_all(row.as_bytes())
-            .map_err(|e| format!("Write failed: {}", e))
-    })?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Log file locked: {}", e))?;
+    file.write_all(row.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
 
     Ok(format!("Log row {} appended", id))
 }
@@ -166,47 +149,62 @@ pub fn update_log(
         .map_err(|e| format!("Failed to read log file: {}", e))?;
 
     let id_str = id.to_string();
-    let mut updated = false;
-    let new_lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            if let Some(first) = line.split(',').next() {
-                if first.trim() == id_str {
-                    let fields: Vec<&str> = line.split(',').collect();
-                    let effective_name = if name.is_empty() {
-                        fields.get(3).unwrap_or(&"").to_string()
-                    } else {
-                        csv_escape(&name)
-                    };
-                    let rebuilt = format!(
-                        "{},{},{},{},{},{},{},{},{}",
-                        fields.first().unwrap_or(&""),
-                        fields.get(1).unwrap_or(&""),
-                        fields.get(2).unwrap_or(&""),
-                        effective_name,
-                        fields.get(4).unwrap_or(&""),
-                        fields.get(5).unwrap_or(&""),
-                        csv_escape(&end_time),
-                        csv_escape(&status),
-                        fields.get(8).unwrap_or(&"0"),
-                    );
-                    updated = true;
-                    return rebuilt;
-                }
+
+    // Parse existing CSV with proper quoting support
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(content.as_bytes());
+
+    let headers = rdr.headers()
+        .map_err(|e| format!("CSV header error: {}", e))?
+        .clone();
+
+    // Write output to buffer
+    let mut wtr_bytes: Vec<u8> = Vec::new();
+    {
+        let mut wtr = WriterBuilder::new()
+            .from_writer(&mut wtr_bytes);
+
+        wtr.write_record(&headers)
+            .map_err(|e| format!("CSV write error: {}", e))?;
+
+        let mut updated = false;
+        for result in rdr.records() {
+            let record = result.map_err(|e| format!("CSV parse error: {}", e))?;
+            let first = record.get(0).unwrap_or("");
+            if first.trim() == id_str {
+                let effective_name = if name.is_empty() {
+                    record.get(3).unwrap_or("").to_string()
+                } else {
+                    name.clone()
+                };
+                let new_record: Vec<String> = vec![
+                    first.to_string(),
+                    record.get(1).unwrap_or("").to_string(),
+                    record.get(2).unwrap_or("").to_string(),
+                    effective_name,
+                    record.get(4).unwrap_or("").to_string(),
+                    record.get(5).unwrap_or("").to_string(),
+                    end_time.clone(),
+                    status.clone(),
+                    record.get(8).unwrap_or("0").to_string(),
+                ];
+                wtr.write_record(&new_record)
+                    .map_err(|e| format!("CSV write error: {}", e))?;
+                updated = true;
+            } else {
+                wtr.write_record(&record)
+                    .map_err(|e| format!("CSV write error: {}", e))?;
             }
-            line.to_string()
-        })
-        .collect();
+        }
 
-    if !updated {
-        return Err(format!("Log row with id {} not found", id));
-    }
+        if !updated {
+            return Err(format!("Log row with id {} not found", id));
+        }
+    } // wtr is dropped here, flushing to wtr_bytes
 
-    let output = new_lines.join("\n") + "\n";
-    retry_write(|| {
-        fs::write(&path, output.as_bytes())
-            .map_err(|e| format!("Log file locked: {}", e))
-    })?;
+    fs::write(&path, &wtr_bytes)
+        .map_err(|e| format!("Log file locked: {}", e))?;
 
     Ok(format!("Log row {} updated", id))
 }
@@ -242,4 +240,190 @@ pub fn open_logs(app: tauri::AppHandle) -> Result<String, String> {
     }
 
     Ok(format!("Opened {}", path.display()))
+}
+
+// ===========================================================================
+//  UNIT TESTS
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csv::{ReaderBuilder, WriterBuilder};
+
+    // --- csv_escape tests ---
+
+    #[test]
+    fn test_csv_escape_no_special_chars() {
+        assert_eq!(csv_escape("hello"), "hello");
+        assert_eq!(csv_escape("simple text"), "simple text");
+    }
+
+    #[test]
+    fn test_csv_escape_with_comma() {
+        assert_eq!(csv_escape("hello, world"), "\"hello, world\"");
+    }
+
+    #[test]
+    fn test_csv_escape_with_quote() {
+        // Inner quotes get doubled, whole field wrapped in quotes
+        assert_eq!(csv_escape("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_escape_with_newline() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn test_csv_escape_empty_string() {
+        assert_eq!(csv_escape(""), "");
+    }
+
+    // --- CSV round-trip tests (verify fix for quoted-comma parsing) ---
+
+    #[test]
+    fn test_read_csv_with_quoted_commas() {
+        // A field containing a comma must survive a write/read round-trip
+        let csv_data = "id,date,type,name\n1,2024-01-01,pomo,\"Task, with commas\"\n";
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv_data.as_bytes());
+
+        let records: Vec<_> = rdr.records().collect();
+        assert_eq!(records.len(), 1);
+        let record = records[0].as_ref().unwrap();
+        assert_eq!(record.get(0).unwrap(), "1");
+        // The comma inside the quoted field must be preserved
+        assert_eq!(record.get(3).unwrap(), "Task, with commas");
+    }
+
+    #[test]
+    fn test_write_then_read_round_trip() {
+        // Write a row with csv_escape, then read back with csv::Reader
+        let name_with_comma = "Buy milk, eggs, bread";
+        let row = format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            42,
+            csv_escape("2024-05-19"),
+            csv_escape("todo"),
+            csv_escape(name_with_comma),
+            csv_escape(""),
+            csv_escape("14:00"),
+            csv_escape(""),
+            csv_escape("pending"),
+            0u32,
+        );
+
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
+
+        let records: Vec<_> = rdr.records().collect();
+        assert_eq!(records.len(), 1);
+        let record = records[0].as_ref().unwrap();
+        // The name field (index 3, 0-based) should contain the full string with commas
+        assert_eq!(record.get(3).unwrap(), name_with_comma);
+    }
+
+    // --- get_next_log_id logic test ---
+
+    #[test]
+    fn test_get_next_log_id_logic() {
+        let csv_data = concat!(
+            "id,date,type,name\n",
+            "1,2024-01-01,pomo,Task1\n",
+            "5,2024-01-02,pomo,Task2\n",
+            "3,2024-01-03,todo,Task3\n",
+        );
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv_data.as_bytes());
+
+        let mut max_id: u32 = 0;
+        for result in rdr.records() {
+            let record = result.unwrap();
+            if let Some(first) = record.get(0) {
+                if let Ok(id) = first.trim().parse::<u32>() {
+                    if id > max_id {
+                        max_id = id;
+                    }
+                }
+            }
+        }
+        // Highest id is 5, so next should be 6
+        assert_eq!(max_id + 1, 6);
+    }
+
+    #[test]
+    fn test_get_next_log_id_empty_csv() {
+        // Only headers, no data rows -> next id should be 1
+        let csv_data = "id,date,type,name\n";
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv_data.as_bytes());
+
+        let mut max_id: u32 = 0;
+        for result in rdr.records() {
+            let record = result.unwrap();
+            if let Some(first) = record.get(0) {
+                if let Ok(id) = first.trim().parse::<u32>() {
+                    if id > max_id {
+                        max_id = id;
+                    }
+                }
+            }
+        }
+        assert_eq!(max_id + 1, 1);
+    }
+
+    // --- update_log logic test ---
+
+    #[test]
+    fn test_update_log_modifies_target_row() {
+        let csv_data = concat!(
+            "id,date,type,name,duration,start_time,end_time,status,pause_count\n",
+            "1,2024-05-19,pomo,Focus,25,10:00,10:25,done,0\n",
+            "2,2024-05-19,pomo,DeepWork,25,10:30,,running,0\n",
+        );
+
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv_data.as_bytes());
+        let headers = rdr.headers().unwrap().clone();
+
+        let mut wtr_bytes: Vec<u8> = Vec::new();
+        {
+            let mut wtr = WriterBuilder::new().from_writer(&mut wtr_bytes);
+            wtr.write_record(&headers).unwrap();
+
+            for result in rdr.records() {
+                let record = result.unwrap();
+                let first = record.get(0).unwrap();
+                if first.trim() == "2" {
+                    let new_record: Vec<String> = vec![
+                        first.to_string(),
+                        record.get(1).unwrap_or("").to_string(),
+                        record.get(2).unwrap_or("").to_string(),
+                        record.get(3).unwrap_or("").to_string(),
+                        record.get(4).unwrap_or("").to_string(),
+                        record.get(5).unwrap_or("").to_string(),
+                        "10:55".to_string(),       // new end_time
+                        "done".to_string(),         // new status
+                        record.get(8).unwrap_or("0").to_string(),
+                    ];
+                    wtr.write_record(&new_record).unwrap();
+                } else {
+                    wtr.write_record(&record).unwrap();
+                }
+            }
+        }
+
+        let output = String::from_utf8(wtr_bytes).unwrap();
+        // Row 2 should now have end_time=10:55 and status=done
+        assert!(output.contains("10:55"), "missing updated end_time");
+        assert!(output.contains("done"), "missing updated status");
+        // Row 1 should still have its original end_time
+        assert!(output.contains("10:25"), "original row 1 was altered");
+    }
 }

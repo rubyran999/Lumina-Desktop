@@ -160,3 +160,16 @@ export async function setMinWindowSize(width: number, height: number): Promise<v
     }
   }
 }
+
+// Enable or disable cursor event capture (click-through)
+export async function setIgnoreCursorEvents(ignore: boolean): Promise<void> {
+  const isTauri = await loadTauriApis();
+  if (isTauri && windowApi) {
+    try {
+      const window = windowApi.getCurrentWindow();
+      await window.setIgnoreCursorEvents(ignore);
+    } catch (error) {
+      console.error('Failed to set ignore cursor events:', error);
+    }
+  }
+}
