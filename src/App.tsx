@@ -7,7 +7,7 @@ import remarkGfm from 'remark-gfm';
 import { cn } from './lib/utils';
 import { useCore } from './hooks/_core';
 import { COUNTRY_PRESETS, UNIT_OPTIONS } from './types';
-import type { AIProvider } from './services/geminiService';
+import type { AIProvider, Message } from './services/geminiService';
 
 export default function App() {
   const {
@@ -786,7 +786,7 @@ export default function App() {
 
                         {/* Messages */}
                         <div className="space-y-4">
-                          {messages.map((msg, i) => (
+                          {messages.map((msg: Message, i: number) => (
                             <motion.div
                               key={i}
                               initial={{ opacity: 0, y: 10 }}
@@ -902,15 +902,13 @@ export default function App() {
                   ref={inputRef}
                   type="text"
                   value={query}
+                  autoFocus
                   onChange={(e) => {
                     setQuery(e.target.value);
                     setLastActionTime(Date.now());
                   }}
                   onFocus={() => {
                     setIsFocused(true);
-                    // We don't auto-expand on focus anymore per user request "only expand after sending or clicking in the bubble"
-                    // Wait, user said "Click anywhere outside the bubble > collapse". 
-                    // And "Click expand button > expand/minimalist".
                   }}
                   onBlur={() => setIsFocused(false)}
                   placeholder={isLogLocked ? "Close CSV file to enable logging..." : "Type a message..."}

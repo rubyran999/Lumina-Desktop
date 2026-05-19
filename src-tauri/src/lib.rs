@@ -76,21 +76,26 @@ pub fn run() {
             // Register global shortcut Ctrl+Q
             #[cfg(desktop)]
             {
-                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
                 let _app_handle = app.handle().clone();
                 let shortcut = Shortcut::new(Some(tauri_plugin_global_shortcut::Modifiers::CONTROL), tauri_plugin_global_shortcut::Code::KeyQ);
 
                 app.global_shortcut()
-                    .on_shortcut(shortcut, move |app, _shortcut, _event| {
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                                // Emit event to frontend to focus input
-                                let _ = window.emit("shortcut-show", ());
+                    .on_shortcut(shortcut, move |app, _shortcut, event| {
+                        // Only act on key PRESS, not release.
+                        // Without this check, the shortcut fires twice per keystroke
+                        // (Pressed = show, Released = hide) causing a flash.
+                        if event.state == ShortcutState::Pressed {
+                            if let Some(window) = app.get_webview_window("main") {
+                                if window.is_visible().unwrap_or(false) {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                    // Emit event to frontend to focus input
+                                    let _ = window.emit("shortcut-show", ());
+                                }
                             }
                         }
                     })?;

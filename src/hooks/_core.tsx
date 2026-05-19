@@ -65,14 +65,8 @@ export function useCore() {
     const savedUserExpanded = localStorage.getItem('lumina_is_user_expanded');
     if (savedUserExpanded !== null) setIsUserExpanded(JSON.parse(savedUserExpanded));
 
-    // Global shortcut listener
+    // Keyboard listener (Escape to collapse — Ctrl+Q is handled by Rust global shortcut)
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+Q to toggle bubble
-      if ((e.ctrlKey || e.metaKey) && e.key === 'q') {
-        e.preventDefault();
-        setIsExpanded(prev => !prev);
-        setLastActionTime(Date.now());
-      }
       if (e.key === 'Escape') {
         setIsExpanded(false);
         setShowSettings(false);
@@ -96,7 +90,7 @@ export function useCore() {
     let unlistenFn: (() => void) | null = null;
     if (isDesktopApp()) {
       listen('shortcut-show', () => {
-        setIsExpanded(prev => !prev);
+        setIsExpanded(true);
         setLastActionTime(Date.now());
       }).then((unlisten) => {
         unlistenFn = unlisten;
@@ -115,9 +109,14 @@ export function useCore() {
     if (isExpanded) {
       setIsUserExpanded(false);
       setShowSettings(false);
-      if (inputRef.current) {
-        inputRef.current.focus();
-      }
+      // Double rAF: wait for React render + layout + paint before focusing.
+      // The input is conditionally rendered inside AnimatePresence, so it
+      // doesn't exist in the DOM until the enter animation starts.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          inputRef.current?.focus();
+        });
+      });
     }
   }, [isExpanded]);
 
