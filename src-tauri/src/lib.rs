@@ -4,6 +4,8 @@ use tauri::{
     Manager, Emitter,
 };
 
+mod logging;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -97,6 +99,14 @@ pub fn run() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            logging::init_logs,
+            logging::check_log_writable,
+            logging::get_next_log_id,
+            logging::append_log,
+            logging::update_log,
+            logging::open_logs,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Bell, Settings, X, Clock, Command, Send, Sparkles, Trash2, CheckCircle2, MessageSquare, Minimize2, Maximize2, Cpu, Globe, Eraser, Link, ChevronDown, Play, Edit3, Save, Pause, RotateCcw } from 'lucide-react';
+import { Search, Bell, Settings, X, Clock, Command, Send, Sparkles, Trash2, CheckCircle2, MessageSquare, Minimize2, Maximize2, Cpu, Globe, Eraser, Link, ChevronDown, Play, Edit3, Save, Pause, RotateCcw, FileSpreadsheet, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, isAfter, parseISO } from 'date-fns';
 import * as math from 'mathjs';
@@ -8,6 +8,7 @@ import remarkGfm from 'remark-gfm';
 import { cn } from './lib/utils';
 import { callAI, Message, AIProvider } from './services/geminiService';
 import { showNotification, playNotificationSound, hideWindow, isDesktopApp, resizeWindow } from './lib/desktop';
+import { initLogs, appendLog, updateLog, openLogs, getNextLogId, isLogWritable, flushLogQueue } from './services/dataLogService';
 import { listen } from '@tauri-apps/api/event';
 
 interface Reminder {
@@ -17,17 +18,20 @@ interface Reminder {
   completed: boolean;
   isAllDay?: boolean;
   noTime?: boolean;
+  createdAt: string;
+  logId?: number; // CSV log row ID for in-place update
 }
 
 interface Pomo {
   id: string;
   name: string;
-  duration: number; // in seconds
+  duration: number;
   totalTime: number;
   mode: 'work' | 'break';
   isActive: boolean;
   finishedCount: number;
   pausesUsed: number;
+  startTime: string;
 }
 
 type SectionState = 'expanded' | 'collapsed';
@@ -176,10 +180,14 @@ export default function App() {
   const [pomoMode, setPomoMode] = useState<'work' | 'break'>('work');
   const [pomoTotalTime, setPomoTotalTime] = useState(25 * 60);
   const [pomoName, setPomoName] = useState('');
+  const [pomoStartTime, setPomoStartTime] = useState('');    // ISO for logging
+  const [pomoPausesUsed, setPomoPausesUsed] = useState(0);   // for logging
   
   const [isTimeout, setIsTimeout] = useState(false);
   const [pendingQuery, setPendingQuery] = useState<string | null>(null);
   const [exchangeRates, setExchangeRates] = useState<Record<string, number>>({});
+  const [nextLogId, setNextLogId] = useState(1);
+  const [isLogLocked, setIsLogLocked] = useState(false);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -226,11 +234,25 @@ export default function App() {
     };
     fetchRates();
 
+    // Initialize the CSV log file and get the next available ID
+    initLogs();
+    getNextLogId().then(id => setNextLogId(id));
+
     const savedReminders = localStorage.getItem('lumina_reminders');
-    if (savedReminders) setReminders(JSON.parse(savedReminders));
+    if (savedReminders) {
+      const parsed = JSON.parse(savedReminders);
+      // Migrate old reminders missing createdAt
+      const migrated = parsed.map((r: any) => r.createdAt ? r : { ...r, createdAt: r.time || new Date().toISOString() });
+      setReminders(migrated);
+    }
     
     const savedPomos = localStorage.getItem('lumina_pomos');
-    if (savedPomos) setPomoList(JSON.parse(savedPomos));
+    if (savedPomos) {
+      const parsed = JSON.parse(savedPomos);
+      // Migrate old pomos missing startTime
+      const migrated = parsed.map((p: any) => p.startTime ? p : { ...p, startTime: new Date().toISOString() });
+      setPomoList(migrated);
+    }
 
     const savedKeys = localStorage.getItem('lumina_api_keys');
     if (savedKeys) setApiKeys(JSON.parse(savedKeys));
@@ -373,6 +395,19 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isExpanded, lastActionTime, isLoading, showSettings]);
 
+  // Poll whether the log CSV is locked by another app (e.g. Excel)
+  useEffect(() => {
+    if (!isExpanded) { setIsLogLocked(false); return; }
+    const check = async () => {
+      const writable = await isLogWritable();
+      setIsLogLocked(!writable);
+      if (writable) flushLogQueue(); // flush any queued writes from lock period
+    };
+    check();
+    const interval = setInterval(check, 3000);
+    return () => clearInterval(interval);
+  }, [isExpanded]);
+
   // Save state
   useEffect(() => {
     localStorage.setItem('lumina_reminders', JSON.stringify(reminders));
@@ -494,7 +529,7 @@ export default function App() {
         }
 
         triggeredReminders.forEach(reminder => {
-          // Show native OS notification
+          // Show native OS notification (reminder only, does NOT auto-complete)
           showNotification('Lumina Reminder', reminder.task);
           // Add to conversation
           const reminderMsg: Message = {
@@ -504,9 +539,6 @@ export default function App() {
             metadata: { time: reminder.time }
           };
           setMessages(prev => [...prev, reminderMsg]);
-          
-          // Mark as completed
-          setReminders(prev => prev.map(r => r.id === reminder.id ? { ...r, completed: true } : r));
         });
 
         // Expand widget to show notification
@@ -536,8 +568,24 @@ export default function App() {
       showNotification('Lumina Pomodoro', `Time for a ${nextMode}!`);
       const nextDuration = nextMode === 'work' ? prefPomoFocus : prefPomoBreak;
       const nextTime = nextDuration * 60;
+      const now = new Date();
       
-      // Update finished count if work mode and pauses <= 3
+      // Log completed work sessions only (skip breaks)
+      if (pomoMode === 'work') {
+        appendLog({
+          id: genLogId(),
+          date: fmtDate(now),
+          name: pomoName,
+          type: 'pomo',
+          duration: String(Math.round(pomoTotalTime / 60)),
+          start_time: fmtISOtoTime(pomoStartTime),
+          end_time: fmtTime(now),
+          status: 'completed',
+          pause_count: pomoPausesUsed,
+        });
+      }
+
+      // Update finished count if work mode
       if (pomoMode === 'work') {
         setPomoList(prev => prev.map(p => {
           if (p.isActive) {
@@ -545,7 +593,7 @@ export default function App() {
             return { 
               ...p, 
               finishedCount: (p.finishedCount || 0) + (isCounted ? 1 : 0),
-              pausesUsed: 0 // Reset for next session
+              pausesUsed: 0,
             };
           }
           return p;
@@ -564,6 +612,12 @@ export default function App() {
       setPomoTotalTime(nextTime);
 
       if (prefPomoAutoStart) {
+        const nowISO = now.toISOString();
+        setPomoStartTime(nowISO);
+        setPomoPausesUsed(0);
+        setPomoList(prev => prev.map(p => 
+          p.isActive ? { ...p, startTime: nowISO, mode: nextMode, totalTime: nextTime } : p
+        ));
         setIsPomoActive(true);
       }
       
@@ -618,6 +672,13 @@ export default function App() {
       setPrefTimeFormat(preset.timeFormat || '12h');
     }
   };
+
+  // Date/time format helpers for CSV logging
+  const fmtDate = (d: Date) => d.toISOString().slice(0, 10);          // YYYY-MM-DD
+  const fmtTime = (d: Date) => d.toTimeString().slice(0, 5);          // HH:MM
+  const fmtISOtoDate = (iso: string) => fmtDate(new Date(iso));
+  const fmtISOtoTime = (iso: string) => fmtTime(new Date(iso));
+  const genLogId = () => { const id = nextLogId; setNextLogId(id + 1); return id; };
 
   const parseTimeInfo = (text: string) => {
     // 1130am, 11:30am, 11:30, 2300, 23:00
@@ -708,14 +769,31 @@ export default function App() {
       const timeInfo = parseTimeInfo(rawTask);
 
       if (!isAiEnabled) {
+        const logId = genLogId();
+        const createdDate = new Date();
         const newReminder: Reminder = {
           id: Math.random().toString(36).substr(2, 9),
           task: timeInfo.task,
           time: timeInfo.found ? timeInfo.time : undefined,
           completed: false,
-          noTime: !timeInfo.found
+          noTime: !timeInfo.found,
+          createdAt: createdDate.toISOString(),
+          logId,
         };
         setReminders(prev => [...prev, newReminder]);
+        
+        // Log todo creation (pending)
+        appendLog({
+          id: logId,
+          date: fmtDate(createdDate),
+          name: timeInfo.task,
+          type: 'todo',
+          duration: '',
+          start_time: fmtTime(createdDate),
+          end_time: '',
+          status: 'pending',
+          pause_count: 0,
+        });
         
         let displayTime = '';
         if (timeInfo.found) {
@@ -763,7 +841,8 @@ export default function App() {
         mode: 'work',
         isActive: true,
         finishedCount: 0,
-        pausesUsed: 0
+        pausesUsed: 0,
+        startTime: new Date().toISOString(),
       };
       
       setPomoList(prev => [newPomo, ...prev.map(p => ({ ...p, isActive: false }))]);
@@ -772,6 +851,8 @@ export default function App() {
       setPomoTotalTime(durationSec);
       setPomoMode('work');
       setPomoName(name);
+      setPomoStartTime(new Date().toISOString());
+      setPomoPausesUsed(0);
       setMessages(prev => [...prev, { 
         role: 'assistant', 
         content: `🍅 **Pomodoro started: ${name}!** ${duration} minutes of focus begins now.`, 
@@ -1038,15 +1119,32 @@ export default function App() {
       setPendingQuery(null);
 
       if (result.type === 'reminder') {
+        const logId = genLogId();
+        const createdDate = new Date();
         const newReminder: Reminder = {
           id: Math.random().toString(36).substr(2, 9),
           task: result.metadata?.task || result.content,
           time: result.metadata?.time,
           isAllDay: result.metadata?.isAllDay,
           noTime: result.metadata?.noTime,
-          completed: false
+          completed: false,
+          createdAt: createdDate.toISOString(),
+          logId,
         };
         setReminders(prev => [...prev, newReminder]);
+
+        // Log todo creation (pending)
+        appendLog({
+          id: logId,
+          date: fmtDate(createdDate),
+          name: newReminder.task,
+          type: 'todo',
+          duration: '',
+          start_time: fmtTime(createdDate),
+          end_time: '',
+          status: 'pending',
+          pause_count: 0,
+        });
       }
     } catch (error) {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -1081,12 +1179,15 @@ export default function App() {
       if (p.id === id) {
         const nextActive = !p.isActive;
         if (nextActive) {
+          const nowISO = new Date().toISOString();
           setIsPomoActive(true);
           setPomoTime(p.duration);
           setPomoTotalTime(p.totalTime);
           setPomoMode(p.mode);
           setPomoName(p.name);
-          return { ...p, isActive: true, pausesUsed: 0 };
+          setPomoStartTime(nowISO);
+          setPomoPausesUsed(0);
+          return { ...p, isActive: true, pausesUsed: 0, startTime: nowISO };
         } else {
           setIsPomoActive(false);
           return { ...p, isActive: false };
@@ -1099,6 +1200,7 @@ export default function App() {
   const pausePomo = () => {
     if (isPomoActive) {
       setIsPomoActive(false);
+      setPomoPausesUsed(prev => prev + 1);
       setPomoList(prev => prev.map(p => {
         if (p.isActive) {
           return { ...p, pausesUsed: (p.pausesUsed || 0) + 1 };
@@ -1113,16 +1215,49 @@ export default function App() {
   const restartPomo = () => {
     const active = pomoList.find(p => p.isActive);
     if (active) {
+      if (active.mode === 'work') {
+        const now = new Date();
+        appendLog({
+          id: genLogId(),
+          date: fmtDate(now),
+          name: pomoName,
+          type: 'pomo',
+          duration: String(Math.round(pomoTotalTime / 60)),
+          start_time: fmtISOtoTime(pomoStartTime),
+          end_time: fmtTime(now),
+          status: 'cancelled',
+          pause_count: pomoPausesUsed,
+        });
+      }
+      const nowISO = new Date().toISOString();
       setPomoTime(active.totalTime);
       setIsPomoActive(false);
-      setPomoList(prev => prev.map(p => p.isActive ? { ...p, pausesUsed: 0 } : p));
+      setPomoStartTime(nowISO);
+      setPomoPausesUsed(0);
+      setPomoList(prev => prev.map(p => p.isActive ? { ...p, pausesUsed: 0, startTime: nowISO } : p));
     }
   };
 
   const deletePomo = (id: string) => {
     setPomoList(prev => {
       const p = prev.find(item => item.id === id);
-      if (p?.isActive) setIsPomoActive(false);
+      if (p) {
+        if (p.isActive) setIsPomoActive(false);
+        if (p.mode === 'work') {
+          const now = new Date();
+          appendLog({
+            id: genLogId(),
+            date: fmtDate(now),
+            name: pomoName,
+            type: 'pomo',
+            duration: String(Math.round(pomoTotalTime / 60)),
+            start_time: fmtISOtoTime(pomoStartTime),
+            end_time: fmtTime(now),
+            status: 'cancelled',
+            pause_count: pomoPausesUsed,
+          });
+        }
+      }
       return prev.filter(item => item.id !== id);
     });
   };
@@ -1151,6 +1286,10 @@ export default function App() {
     const timeInfo = parseTimeInfo(editingReminderTimeValue);
     setReminders(prev => prev.map(r => {
       if (r.id === id) {
+        // Sync renamed task to the log CSV
+        if (r.logId && editingReminderValue !== r.task) {
+          updateLog(r.logId, '', '', editingReminderValue);
+        }
         return { 
           ...r, 
           task: editingReminderValue,
@@ -1165,7 +1304,17 @@ export default function App() {
   };
 
   const toggleReminder = (id: string) => {
-    setReminders(prev => prev.map(r => r.id === id ? { ...r, completed: !r.completed } : r));
+    setReminders(prev => prev.map(r => {
+      if (r.id === id) {
+        const nextCompleted = !r.completed;
+        // Log when a todo is completed
+        if (nextCompleted && r.logId) {
+          updateLog(r.logId, fmtTime(new Date()), 'completed', r.task);
+        }
+        return { ...r, completed: nextCompleted };
+      }
+      return r;
+    }));
     setLastActionTime(Date.now());
   };
 
@@ -1237,6 +1386,13 @@ export default function App() {
                         <Eraser className="w-4 h-4" />
                       </button>
                     )}
+                    <button 
+                      onClick={() => openLogs()}
+                      title="Open Productivity Log"
+                      className="p-2 rounded-lg text-slate-500 hover:bg-white/5 hover:text-emerald-400 transition-colors"
+                    >
+                      <FileSpreadsheet className="w-4 h-4" />
+                    </button>
                     <button 
                       onClick={() => setShowSettings(!showSettings)}
                       className={cn("p-2 rounded-lg transition-colors", showSettings ? "bg-indigo-500/20 text-indigo-400" : "text-slate-500 hover:bg-white/5 hover:text-white")}
@@ -1311,19 +1467,22 @@ export default function App() {
                             <div className="flex items-center gap-1">
                               <button 
                                 onClick={pausePomo}
-                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors"
+                                disabled={isLogLocked}
+                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 {isPomoActive ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                               </button>
                               <button 
                                 onClick={restartPomo}
-                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors"
+                                disabled={isLogLocked}
+                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 <RotateCcw className="w-3.5 h-3.5" />
                               </button>
                               <button 
                                 onClick={() => deletePomo(activePomo.id)}
-                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-red-400 transition-colors"
+                                disabled={isLogLocked}
+                                className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
@@ -1341,7 +1500,8 @@ export default function App() {
                             <div className="flex items-center gap-1">
                               <button 
                                 onClick={() => toggleReminder(actualNextReminder.id)}
-                                className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-green-400"
+                                disabled={isLogLocked}
+                                className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed"
                               >
                                 <CheckCircle2 className="w-3 h-3" />
                               </button>
@@ -1401,7 +1561,8 @@ export default function App() {
                                   {!p.isActive && (
                                     <button 
                                       onClick={() => togglePomo(p.id)}
-                                      className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-green-400 transition-colors"
+                                      disabled={isLogLocked}
+                                      className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-green-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                                     >
                                       <Play className="w-3 h-3" />
                                     </button>
@@ -1409,14 +1570,16 @@ export default function App() {
                                   {p.isActive && (
                                     <button 
                                       onClick={() => setIsPomoActive(false)}
-                                      className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-white transition-colors"
+                                      disabled={isLogLocked}
+                                      className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                                     >
                                       <X className="w-3 h-3" />
                                     </button>
                                   )}
                                   <button 
                                     onClick={() => deletePomo(p.id)}
-                                    className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-red-400 transition-colors"
+                                    disabled={isLogLocked}
+                                    className="p-1 rounded-lg hover:bg-white/10 text-slate-500 hover:text-red-400 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                                   >
                                     <Trash2 className="w-3 h-3" />
                                   </button>
@@ -1519,20 +1682,23 @@ export default function App() {
                                 {editingReminderId !== r.id && (
                                   <button 
                                     onClick={() => startEditingReminder(r)}
-                                    className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-indigo-400"
+                                    disabled={isLogLocked}
+                                    className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed"
                                   >
                                     <Edit3 className="w-3 h-3" />
                                   </button>
                                 )}
                                 <button 
                                   onClick={() => toggleReminder(r.id)}
-                                  className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-green-400"
+                                  disabled={isLogLocked}
+                                  className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed"
                                 >
                                   <CheckCircle2 className="w-3 h-3" />
                                 </button>
                                 <button 
                                   onClick={() => deleteReminder(r.id)}
-                                  className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-red-400"
+                                  disabled={isLogLocked}
+                                  className="p-1 rounded-md hover:bg-white/10 text-slate-400 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed"
                                 >
                                   <Trash2 className="w-3 h-3" />
                                 </button>
@@ -1966,6 +2132,14 @@ export default function App() {
               </div>
             </div>
 
+            {/* Log-locked warning */}
+            {isLogLocked && (
+              <div className="mx-4 p-2 rounded-xl bg-red-500/15 border border-red-500/30 flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
+                <span className="text-[10px] text-red-300 font-medium">CSV log file is open in another app. Close it to resume logging.</span>
+              </div>
+            )}
+
             {/* Input Area */}
             <div 
               onClick={() => {
@@ -2004,12 +2178,16 @@ export default function App() {
                     // And "Click expand button > expand/minimalist".
                   }}
                   onBlur={() => setIsFocused(false)}
-                  placeholder="Type a message..."
-                  className="w-full bg-white/5 border border-white/10 rounded-2xl pl-4 pr-12 py-3 text-sm outline-none focus:border-indigo-500/50 transition-all"
+                  placeholder={isLogLocked ? "Close CSV file to enable logging..." : "Type a message..."}
+                  disabled={isLogLocked}
+                  className={cn(
+                    "w-full bg-white/5 border rounded-2xl pl-4 pr-12 py-3 text-sm outline-none transition-all",
+                    isLogLocked ? "border-red-500/30 text-slate-600 cursor-not-allowed" : "border-white/10 focus:border-indigo-500/50"
+                  )}
                 />
                 <button 
                   type="submit"
-                  disabled={!query.trim() || isLoading}
+                  disabled={!query.trim() || isLoading || isLogLocked}
                   className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-xl bg-indigo-600 text-white disabled:opacity-30 transition-all"
                 >
                   <Send className="w-4 h-4" />
